@@ -6,8 +6,9 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, TrainingArguments, Trainer, DataCollatorWithPadding
 from datasets import Dataset, concatenate_datasets
 from peft import LoraConfig, TaskType
-from utils import miscalibration_analysis, hallucination_analysis, create_powerlaw_p, batch_log_probability
-from utils import tokenize_function, custom_data_collator, sample
+from utils import miscalibration_analysis, create_powerlaw_p, tokenize_function, custom_data_collator, sample
+from utils_callback import CallBackTrainer
+
 
 ##set up cuda device 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,9 +46,9 @@ lora_config = LoraConfig(
 
 ##load data
 np.random.seed(1217) 
-data_path = "/home1/m/miaom/hallucination/llm_data_2_prompt_generation_T5.csv"
+data_path = "TBU" 
 data = pd.read_csv(data_path)
-length_data = 5000
+length_data = 10000
 dataset = data[0:length_data]
 train_datasets = {}
 p_datasets = {}
@@ -62,7 +63,7 @@ for alpha in [1, 1.5, 2]:
 model = AutoModelForSeq2SeqLM.from_pretrained("t5-base").to(device)
 tokenizer = AutoTokenizer.from_pretrained("t5-base")
 # Use the first training dataset (DataFrame with columns "x" and "y")
-alpha, train_texts = list(train_datasets.items())[1]
+alpha, train_texts = list(train_datasets.items())[0] #options are 0, 1, 2
 print(f"alpha is: {alpha}")
 print(f"\n{'='*20} Fine-tuning for Pareto α = {alpha} {'='*20}")
 print(train_texts)
@@ -70,7 +71,9 @@ print(train_texts)
 # Build HF Dataset
 train_dataset = Dataset.from_dict({
     "x": train_texts["x"].tolist(),
-    "y": train_texts["y"].tolist()
+    "y": train_texts["y"].tolist(),
+    "names": train_texts["names"].tolist(),
+    "gold": train_texts["gold"].tolist()
 })
 
 # Tokenize and split
@@ -79,13 +82,27 @@ split_dataset = tokenized_train.train_test_split(test_size=0.1, seed=1217)
 train_dataset_final = split_dataset["train"]
 eval_dataset_final = split_dataset["test"]
 
+callback = CallBackTrainer(
+    train_dataset_texts=train_dataset_final,
+    train_datasets = train_datasets, 
+    p_datasets=p_datasets,
+    tokenizer=tokenizer,
+    alpha=alpha,
+    device=device,
+    output_csv_path=f"TBU",
+    epsilon=0.1,
+    batch_size=48
+)
+
+######NORMAL TRAINING#####
+
 ##set training arguments
 training_args = TrainingArguments(
     output_dir=f"cache/model_lora_alpha{alpha}",
     overwrite_output_dir=True,
-    num_train_epochs=64,
-    per_device_train_batch_size=128,
-    gradient_accumulation_steps=8,
+    num_train_epochs=95,
+    per_device_train_batch_size=32,
+    gradient_accumulation_steps=32,
     learning_rate=5e-4,
     fp16=True,
     logging_steps=10,
@@ -99,15 +116,16 @@ trainer = Trainer(
     train_dataset=train_dataset_final,
     eval_dataset=eval_dataset_final,
     data_collator=lambda features: custom_data_collator(features, tokenizer),
-    args=training_args
+    args=training_args,
+    callbacks=[callback] 
 )
 
 trainer.train()
-##save the model weights for later testing
-trainer.save_model(f"/home1/m/miaom/hallucination/model_alpha{alpha}_2_5000")
-eval_results = trainer.evaluate()
-print("Validation loss:", eval_results.get("eval_loss"))
 
-exact_h_rate, output_table = hallucination_analysis(model, train_dataset_final["y"], tokenizer, 128, device)
-miscal_rate, miscal_output_table = miscalibration_analysis(p_datasets, model, tokenizer, alpha, 0.1, device)
-print(f"Hallucination rate is: {exact_h_rate} and miscalibration is: {miscal_rate}")
+
+#######END OF TRAININIG####
+
+tvd, regret, miscal_output_table = miscalibration_analysis(p_datasets, train_datasets, model, tokenizer, alpha, 0.1, device)
+print(f"Loss rate is: miscalibration is: {tvd} and regret is: {regret}")
+miscal_output_table.to_csv(f"TBU", index=False)
+

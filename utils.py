@@ -1,23 +1,25 @@
 import pandas as pd
 import numpy as np
 import random
+import os 
 from collections import Counter
 from scipy.stats import pareto
 import scipy.stats as stats
 import math
 import torch
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import ast
 
-random.seed(1217)
-def create_powerlaw_p(df, pareto_alpha):
-    new_rows = []
-    for _, row in df.iterrows():
-        reps = int(np.floor(pareto.rvs(b=pareto_alpha, scale=1)))
-        for _ in range(reps):
-            new_rows.append((row['x'], row['y']))
-    power_df = pd.DataFrame(new_rows, columns=['x', 'y'])
-    print(f"Monofact % in p is: {mono_calc(power_df)}")
-    return power_df
+# random.seed(1217)
+def create_powerlaw_p(df, pareto_alpha, random_state=1217):
+    base = df[['x','y','names','gold']].copy()
+    rng = np.random.default_rng(random_state)
+    # draw Pareto samples, floor them, and force at least 1 repetition
+    reps = pareto.rvs(b=pareto_alpha, scale=1, size=len(base), random_state=rng)
+    reps = np.floor(reps).astype(int)
+    reps = np.maximum(reps, 1)
+    return base.loc[base.index.repeat(reps)].reset_index(drop=True)
 
 def sample(power_df, size):
     sampled_df = power_df.sample(n=size, replace=True, random_state=1217)
@@ -25,7 +27,7 @@ def sample(power_df, size):
     return sampled_df
 
 def mono_calc(df):
-    pairs = list(zip(df['x'], df['y']))
+    pairs = list(zip(df['x'], df['y'], df['names'], df['gold']))
     pair_counts = Counter(pairs)
     num_mono = sum(1 for c in pair_counts.values() if c == 1)
     return num_mono / len(df) if len(df) else 0.0
@@ -51,64 +53,10 @@ def batch_log_probability(model, tokenizer, input_texts, target_texts, device, b
             results.append(total_lp)
     return results
 
-def tokenize_statement(s):
-    """Split the statement on commas and strip whitespace.
-    Returns a set of tokens."""
-    return set(token.strip() for token in s.split(",") if token.strip())
-
-def check_exact_hallucination_batch(statements, truth_set):
-    return [statement not in truth_set for statement in statements]
-
-def hallucination_analysis(model, truth_list, tokenizer, batch_size=32):
-    sample_size = 1  # one generation per prompt
-    total_prompts = 0
-    total_exact_hallucinated = 0
-    generated_info = []  # will store tuples: (prompt, generated statement)
-
-    fixed_prompt = "[PROMPT]"
-    num_examples = len(truth_list)
-    truth_set = set(truth_list)
-
-    for i in tqdm(range(0, num_examples, batch_size), desc="Processing hallucination"):
-        current_batch_size = min(batch_size, num_examples - i)
-        # Use the fixed prompt for every example in this batch.
-        input_texts = [fixed_prompt] * current_batch_size
-        total_prompts += current_batch_size
-
-        # Tokenize the batch.
-        inputs = tokenizer(input_texts, return_tensors="pt", padding=True, truncation=True).to(device)
-
-        # Generate outputs in batch.
-        outputs = model.generate(
-            **inputs,
-            do_sample=True,
-            num_return_sequences=sample_size,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
-        )
-
-        # Decode outputs.
-        decoded_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        # Group outputs so that each prompt gets its corresponding generated text.
-        grouped_generated = [decoded_texts[j:j+sample_size] for j in range(0, len(decoded_texts), sample_size)]
-
-        # For each prompt in the batch, compare the generated output against the entire truth set.
-        for prompt_text, gen_list in zip(input_texts, grouped_generated):
-            generated_info.extend([(prompt_text, gen) for gen in gen_list])
-
-            # Use updated helper functions (which compare each generated output against the entire truth list).
-            exact_flags = check_exact_hallucination_batch(gen_list, truth_set)
-            total_exact_hallucinated += sum(exact_flags)
-
-    exact_hallucination_rate = total_exact_hallucinated / total_prompts
-    return exact_hallucination_rate, generated_info
-
 def create_epsilon_induced_bins(epsilon):
    if epsilon < 0:
        raise ValueError("Epsilon must be non-negative")
    if epsilon == 0:
-       # For epsilon = 0, we create a bin for each unique probability in g
-       # This will be handled in the main calibration function
        return "finest"
    if epsilon >= 1:
        # When epsilon = 1, return single bin for all probabilities
@@ -129,95 +77,7 @@ def create_epsilon_induced_bins(epsilon):
    bins.append((1.0, 1.0))
    return bins
 
-
-def miscalibration_calc(p_probs_normalized, g_probs_normalized, epsilon):
-    bins = create_epsilon_induced_bins(epsilon)
-
-    if isinstance(bins, str) and bins == "finest":
-       unique_probs = sorted(set(g_probs_normalized), reverse=True)
-       bins = [(p, p) for p in unique_probs]
-
-    # Assign facts to bins and calculate sums
-    binned_facts = [[] for _ in range(len(bins))]
-    binned_p_sums = [0.0] * len(bins)
-    binned_g_sums = [0.0] * len(bins)
-
-    # Bin assignment
-    for i, (p_val, g_val) in enumerate(zip(p_probs_normalized, g_probs_normalized)):
-       assigned = False
-       for bin_idx, (low, high) in enumerate(bins):
-          if epsilon != 0:
-               if low <= g_val < high:
-                   binned_p_sums[bin_idx] += p_val
-                   binned_g_sums[bin_idx] += g_val
-                   assigned = True
-                   break
-          else:
-               if low <= g_val <= high:
-                   binned_p_sums[bin_idx] += p_val
-                   binned_g_sums[bin_idx] += g_val
-                   assigned = True
-                   break
-       if not assigned:
-           last_idx = len(bins) - 1
-           binned_p_sums[last_idx] += p_val
-           binned_g_sums[last_idx] += g_val
-
-    # Calculate miscalibration
-    miscalibration = 0.5 * sum(abs(binned_p_sums[i] - binned_g_sums[i]) for i in range(len(bins)))
-    return miscalibration
-
-
-def miscalibration_analysis(model, alpha, epsilon):
-# Evaluate miscalibration using p_datasets
-##p calcs
-  p_list = []
-  for stmt in tqdm(p_datasets[alpha]["y"], desc = "Processing miscalibration"):
-      # core = stmt.replace(special_token, "").strip().strip(',')
-      p_list.append(stmt)
-  p_counts = Counter(p_list)
-  N = len(p_list)
-  p_probs = [p_counts[stmt]/N for stmt in p_list]
-  total_p = sum(p_probs)
-  p_probs_normalized = [p / total_p for p in p_probs]
-  counts = [p_counts[stmt] for stmt in p_list]
-  print("p_probs_normalized completed calc")
-
-##g calcs
-  g_probs = []
-
-  x_list = p_datasets[alpha]["x"].tolist()
-  y_list = p_datasets[alpha]["y"].tolist()
-
-  log_probs = batch_log_probability(model, tokenizer, x_list, y_list, device, 64)
-
-  for log_prob in log_probs:
-    g_probs.append(math.exp(log_prob))
-  total_g = sum(g_probs)
-  g_probs_normalized = [g / total_g for g in g_probs]
-  print("g_probs_normalized completed calc")
-
-  miscal_table = pd.DataFrame({
-        "stmt": p_datasets[alpha]["y"],
-        "counts": counts,
-        "p": p_probs,
-        "g": g_probs,
-        "p_norm": p_probs_normalized,
-        "g_norm": g_probs_normalized
-    })
-
-  miscal_table = miscal_table.sort_values(by="counts", ascending=False)
-  ##miscal
-  tvd = miscalibration_calc(p_probs_normalized, g_probs_normalized, epsilon)
-  print(f"Miscalibration (TVD): {tvd}")
-  return tvd, miscal_table
-
-
 def tokenize_function(tokenizer, example):
-    # Convert your BERT-style input into T5 format:
-    # For one masked word, do:
-    #   x: "Kpaveda, <extra_id_0>"
-    #   y: "<extra_id_0> Word2"
     input_text = example["x"]
     target_text = example["y"]
     inputs = tokenizer(input_text, truncation=True)
@@ -225,7 +85,7 @@ def tokenize_function(tokenizer, example):
     inputs["labels"] = targets["input_ids"]
     return inputs
 
-def custom_data_collator(features):
+def custom_data_collator(features, tokenizer):
     # 1) Separate labels (unchanged)
     labels_list = [f["labels"] for f in features]
     features_no_labels = [{k: v for k, v in f.items() if k != "labels"} for f in features]
@@ -251,3 +111,319 @@ def custom_data_collator(features):
         batch["sample_weight"] = torch.tensor(weights, dtype=torch.float)
 
     return batch
+
+##############ANALYSIS FUNCTIONS##############
+def miscalibration_calc(p_probs, g_probs, epsilon, alpha):
+    # 1. Build epsilon-induced bins
+    bins = create_epsilon_induced_bins(epsilon)
+    if bins == "finest":
+        unique_vals = sorted(set(g_probs), reverse=True)
+        bins = [(v, v) for v in unique_vals]
+
+    # 2. Initialize per-bin sums
+    binned_p = [0.0] * len(bins)
+    binned_g = [0.0] * len(bins)
+
+    # 3. Assign each (p,g) to a bin (with fall-through to last bin)
+    for p, g in zip(p_probs, g_probs):
+        placed = False
+        for idx, (low, high) in enumerate(bins):
+            if epsilon != 0:
+                if low <= g < high:
+                    binned_p[idx] += p
+                    binned_g[idx] += g
+                    placed = True
+                    break
+            else:
+                # when epsilon == 0, make upper bound inclusive
+                if low <= g <= high:
+                    binned_p[idx] += p
+                    binned_g[idx] += g
+                    placed = True
+                    break
+        if not placed:
+            # dump into last bin
+            binned_p[-1] += p
+            binned_g[-1] += g
+
+    # 4. Compute per-bin |Δ| and total miscalibration
+    miscal_bins = [abs(p_sum - g_sum) for p_sum, g_sum in zip(binned_p, binned_g)]
+    total_miscal = 0.5 * sum(miscal_bins)
+
+    # 5. Build summary DataFrame
+    df = pd.DataFrame({
+        "alpha":        [alpha] * len(bins),
+        "bin":    list(range(len(bins))),
+        "p_sum":        binned_p,
+        "g_sum":        binned_g,
+        "miscal_bin":   miscal_bins,
+        "total_miscal": [total_miscal] * len(bins),
+    })
+
+    return df
+
+def regret_calc(p_probs, g_probs, epsilon):
+    print("Conducting KL divergence analysis...")
+    bins = create_epsilon_induced_bins(epsilon)
+    if bins == "finest":
+        unique = sorted(set(g_probs), reverse=True)
+        bins = [(u,u) for u in unique]
+    bin_edges = np.array([(low, high) for low,high in bins])
+    gs = np.array(g_probs)
+    ps = np.array(p_probs)
+    regrets = []
+    for i,(low,high) in enumerate(bin_edges):
+        mask = (gs>=low) & (gs<(high if epsilon!=0 else high+1e-12))
+        p_sum = ps[mask].sum()
+        g_sum = gs[mask].sum()
+        if p_sum == 0:
+            r = 0.0
+        elif g_sum == 0:
+            r = float('inf')
+        else:
+            r = p_sum * math.log(p_sum/g_sum)
+        regrets.append(r)
+    total = sum(regrets)
+    df = pd.DataFrame({
+        "bin":    list(range(len(bins))),
+        "regret": regrets,
+        "total_regret": [total]*len(bins)
+    })
+    return df
+
+def batched(it, n):
+    """Yield successive n-sized chunks from iterable it."""
+    it = iter(it)
+    from itertools import islice
+    while True:
+        chunk = list(islice(it, n))
+        if not chunk:
+            return
+        yield chunk
+
+
+def miscalibration_analysis(p_datasets, train_datasets, model, tokenizer, alpha, epsilon, device):
+    print("Conducting miscalibration analysis...")
+    # normalize true distributions
+    def compute_norm_probs(stmts):
+        counts = Counter(stmts)
+        N = len(stmts)
+        probs = np.array([counts[s] / N for s in stmts])
+        return probs / probs.sum()
+
+    p_stmts = p_datasets[alpha]["y"].tolist()
+    train_p_stmts = train_datasets[alpha]["y"].tolist()
+    p_probs = compute_norm_probs(p_stmts)
+    train_p_probs = compute_norm_probs(train_p_stmts)
+
+    x_list, y_list = p_datasets[alpha]["x"].tolist(), p_datasets[alpha]["y"].tolist()
+    train_x, train_y = train_datasets[alpha]["x"].tolist(), train_datasets[alpha]["y"].tolist()
+
+    model.eval()
+    torch.cuda.empty_cache()
+    pbar = tqdm(total=2, desc="Log-probs")
+    with torch.no_grad():
+        g_log_probs = batch_log_probability(model, tokenizer, x_list, y_list, device, batch_size=16)
+        pbar.update(1)
+        train_g_log_probs = batch_log_probability(model, tokenizer, train_x, train_y, device, batch_size=16)
+        pbar.update(1)
+    pbar.close()
+    # model.train()
+    g_probs       = np.exp(g_log_probs);       g_probs       /= g_probs.sum()
+    train_g_probs = np.exp(train_g_log_probs); train_g_probs /= train_g_probs.sum()
+    miscal_df  = miscalibration_calc(p_probs, g_probs, epsilon, alpha)
+    regret_df  = regret_calc( train_p_probs, train_g_probs, epsilon)
+    merged_df  = pd.merge(miscal_df, regret_df, on="bin", how="left")
+
+    tvd    = miscal_df["total_miscal"].iat[0]
+    regret = regret_df["total_regret"].iat[0]
+    return tvd, regret, merged_df
+
+def dedupe_by_y(ds):
+    """
+    ds: either a dict-like {'x','y','gold',...} or a Dataset
+    returns: a dict with only unique 'y' entries kept,
+             and parses 'gold' strings into real lists.
+    """
+    # determine columns
+    if hasattr(ds, "column_names"):
+        cols = ds.column_names
+    else:
+        cols = list(ds.keys())
+
+    seen = set()
+    out = {k: [] for k in cols}
+    for row in zip(*[ds[k] for k in cols]):
+        y = row[cols.index("y")]
+        if y in seen:
+            continue
+        seen.add(y)
+        for k, val in zip(cols, row):
+            if k == "gold" and isinstance(val, str):
+                # parse the list‐literal string into an actual Python list
+                out[k].append(ast.literal_eval(val))
+            else:
+                out[k].append(val)
+    return out
+
+def inaccuracy_analysis(model, train_dataset_final, tokenizer, batch_size, alpha, device):
+    """
+    Token‐level attribute eval over *unique* y’s:
+      • returns (avg attribute‐loss, avg attribute‐inaccuracy)
+      • writes per‐example CSV aligned to the deduped set
+    """
+    print("Conducting token‐level attribute analysis…")
+    mini = dedupe_by_y(train_dataset_final)
+    xs, ys, golds = mini['x'], mini['y'], mini['gold']
+    n = len(ys)
+
+    # Pre‐tokenize all gold attributes (skip the name at index 0)
+    gold_vids = [
+        [tokenizer(val, add_special_tokens=False)["input_ids"]
+         for val in gold_list[1:]]
+        for gold_list in golds
+    ]
+
+    per_loss = [None] * n
+    per_acc  = [None] * n
+
+    model.to(device).eval()
+    for i in tqdm(range(0, n, batch_size), desc="Attr eval", unit="batch"):
+        bs      = min(batch_size, n - i)
+        batch_x = xs[i : i + bs]
+        batch_y = ys[i : i + bs]
+
+        inp = tokenizer(batch_x, return_tensors="pt",
+                        padding=True, truncation=True).to(device)
+        tgt = tokenizer(batch_y, return_tensors="pt",
+                        padding=True, truncation=True).to(device)
+
+        with torch.no_grad():
+            logits   = model(**inp, labels=tgt["input_ids"]).logits
+            logp     = torch.log_softmax(logits, dim=-1)  # [bs, seq, vocab]
+            pred_ids = logp.argmax(dim=-1)                # [bs, seq]
+
+        tgt_ids = tgt["input_ids"]
+        for b in range(bs):
+            idx       = i + b
+            ids_list  = tgt_ids[b].tolist()
+            lp_tensor = logp[b]
+            vids_list = gold_vids[idx]
+
+            # attribute‐loss
+            total_lp, total_tok = 0.0, 0
+            for vid in vids_list:
+                L = len(vid)
+                for k in range(len(ids_list) - L + 1):
+                    if ids_list[k:k+L] == vid:
+                        for j, tok in enumerate(vid):
+                            total_lp += lp_tensor[k+j, tok].item()
+                        total_tok += L
+            ex_loss = -total_lp / total_tok if total_tok > 0 else None
+
+            # attribute‐accuracy
+            corr = 0
+            for vid in vids_list:
+                L = len(vid)
+                ok = any(
+                    ids_list[k:k+L]    == vid and
+                    pred_ids[b, k:k+L].tolist() == vid
+                    for k in range(len(ids_list) - L + 1)
+                )
+                corr += ok
+            ex_acc = corr / len(vids_list) if vids_list else 0.0
+
+            per_loss[idx] = ex_loss
+            per_acc[idx]  = ex_acc
+
+    # compute averaged metrics
+    losses    = [l for l in per_loss if l is not None]
+    accs      = [a for a in per_acc  if a is not None]
+    avg_loss  = sum(losses) / len(losses) if losses else 0.0
+    avg_acc   = sum(accs)   / len(accs)   if accs    else 0.0
+    avg_inacc = 1.0 - avg_acc
+
+    # save per‐example CSV
+    out_df = pd.DataFrame({
+        "x":               xs,
+        "y":               ys,
+        "gold":            golds,
+        "attr_loss":       per_loss,
+        "attr_accuracy":   per_acc,
+        "attr_inaccuracy":[None if a is None else 1.0-a for a in per_acc]
+    })
+    print(f"Saving attribute analysis to CSV for alpha {alpha}...")
+    out_df.to_csv(f"TBU", index=False)
+
+    return avg_loss, avg_inacc
+
+def hallucination_analysis(model, train_dataset_final, tokenizer, batch_size, alpha, device):
+    """
+    Free-run hallucination metric with speedups:
+      - cache gold lookup & prompt tokens
+      - use torch.inference_mode & AMP
+      - reuse prompt_ids/attention_mask
+      - vectorized post-processing
+    """
+    # cache name→gold mapping
+    if not hasattr(hallucination_analysis, "_name_to_gold") or hallucination_analysis._cached_ds is not train_dataset_final:
+        raw = [ast.literal_eval(g) if isinstance(g, str) else g for g in train_dataset_final["gold"]]
+        hallucination_analysis._name_to_gold = {g[0]: g for g in raw}
+        hallucination_analysis._cached_ds = train_dataset_final
+    name_to_gold = hallucination_analysis._name_to_gold
+
+    # cache prompt tokens
+    prompt = "<BIOGRAPHY>"
+    if not hasattr(hallucination_analysis, "_prompt"):
+        toks = tokenizer(prompt, return_tensors="pt", truncation=True)
+        hallucination_analysis._prompt = {
+            "input_ids": toks.input_ids.to(device),
+            "attention_mask": toks.attention_mask.to(device)
+        }
+    prompt_inputs = hallucination_analysis._prompt
+
+    model.to(device).eval()
+    gens = []
+    n = len(train_dataset_final["gold"])
+    for i in range(0, n, batch_size):
+        bs = min(batch_size, n - i)
+        inp = {
+            "input_ids": prompt_inputs["input_ids"].repeat(bs, 1),
+            "attention_mask": prompt_inputs["attention_mask"].repeat(bs, 1)
+        }
+        with torch.inference_mode(), torch.cuda.amp.autocast():
+            outs = model.generate(
+                **inp,
+                do_sample=True,
+                num_return_sequences=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                max_new_tokens=128
+            )
+        gens += tokenizer.batch_decode(outs, skip_special_tokens=True)
+
+    # extract names, lookup golds, compute hall rates
+    names = [(" ".join(g.split()[:2])).rstrip("'s") for g in gens]
+    golds_list = [name_to_gold.get(n, [None]*7)[1:] for n in names]
+    hall_rates = []
+    total_incorrect = total_attrs = 0
+    for gen, attrs in zip(gens, golds_list):
+        correct = sum(1 for a in attrs if a and a in gen)
+        incorrect = len(attrs) - correct
+        hall_rates.append(incorrect / len(attrs))
+        total_incorrect += incorrect
+        total_attrs += len(attrs)
+
+    # save results
+    df = pd.DataFrame({
+        "predicted_name": names,
+        "generation":     gens,
+        "gold":           golds_list,
+        "hall_rate":      hall_rates
+    })
+    print(f"Saving hallucination analysis to CSV for alpha {alpha}...")
+    df.to_csv(f"TBU", index=False)
+    hall_rate = total_incorrect / total_attrs if total_attrs else 0.0
+    print(f"hallucination rate is:{hall_rate}")
+    return hall_rate
+

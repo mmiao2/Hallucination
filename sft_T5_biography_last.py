@@ -6,9 +6,9 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, TrainingArguments, Trainer, DataCollatorWithPadding
 from datasets import Dataset, concatenate_datasets
 from peft import LoraConfig, TaskType
-from utils import miscalibration_analysis, hallucination_analysis, create_powerlaw_p, batch_log_probability
-from utils import tokenize_function, custom_data_collator, sample
-from twostage_utils import WeightedTrainer
+from utils import miscalibration_analysis, create_powerlaw_p, tokenize_function, custom_data_collator, sample
+from utils_callback import CallBackTrainer
+
 
 ##set up cuda device 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,9 +46,9 @@ lora_config = LoraConfig(
 
 ##load data
 np.random.seed(1217) 
-data_path = "/home1/m/miaom/hallucination/llm_data_2_prompt_generation_T5.csv"
+data_path = "TBU" 
 data = pd.read_csv(data_path)
-length_data = 5000
+length_data = 10000
 dataset = data[0:length_data]
 train_datasets = {}
 p_datasets = {}
@@ -59,34 +59,22 @@ for alpha in [1, 1.5, 2]:
   train_datasets[alpha] = training_data
   p_datasets[alpha] = powerlaw_p
 
-#get the pretrained model
-model = AutoModelForSeq2SeqLM.from_pretrained("/home1/m/miaom/hallucination/model_alpha1.5_2_5000")
+##device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = AutoModelForSeq2SeqLM.from_pretrained("t5-base").to(device)
 tokenizer = AutoTokenizer.from_pretrained("t5-base")
-#starting point of second stage training is the first model
-model_weighted = copy.deepcopy(model)
-
 # Use the first training dataset (DataFrame with columns "x" and "y")
-alpha, train_texts = list(train_datasets.items())[1]
+alpha, train_texts = list(train_datasets.items())[0] #options are 0, 1, 2
 print(f"alpha is: {alpha}")
 print(f"\n{'='*20} Fine-tuning for Pareto α = {alpha} {'='*20}")
 print(train_texts)
 
-#randomly select a percentage of index 
-pct = 0.45 #toggle1 between 0.05, 0.15, 0.3, 0.45
-length = int((len(train_texts) * pct))
-##randomly select length number of indices
-indices = np.random.choice(len(train_texts), size=length, replace=False)
-
 # Build HF Dataset
-train_texts = train_texts.reset_index(drop=True)
 train_dataset = Dataset.from_dict({
-    "x": train_texts["x"][indices].tolist(),
-    "y": train_texts["y"][indices].tolist()
+    "x": train_texts["x"].tolist(),
+    "y": train_texts["y"].tolist(),
+    "names": train_texts["names"].tolist(),
+    "gold": train_texts["gold"].tolist()
 })
-
-#duplicates
-duplication_count = 5 #toggle2 between 1, 3, 5
-train_dataset = concatenate_datasets([train_dataset] * (duplication_count + 1))
 
 # Tokenize and split
 tokenized_train = train_dataset.map(lambda example: tokenize_function(tokenizer, example), batched=False)
@@ -94,13 +82,27 @@ split_dataset = tokenized_train.train_test_split(test_size=0.1, seed=1217)
 train_dataset_final = split_dataset["train"]
 eval_dataset_final = split_dataset["test"]
 
+callback = CallBackTrainer(
+    train_dataset_texts=train_dataset_final,
+    train_datasets = train_datasets, 
+    p_datasets=p_datasets,
+    tokenizer=tokenizer,
+    alpha=alpha,
+    device=device,
+    output_csv_path=f"TBU",
+    epsilon=0.1,
+    batch_size=48
+)
+
+######NORMAL TRAINING#####
+
 ##set training arguments
 training_args = TrainingArguments(
-    output_dir=f"temp/model_lora_alpha_sec_stage{alpha}",
+    output_dir=f"cache/model_lora_alpha{alpha}",
     overwrite_output_dir=True,
     num_train_epochs=64,
-    per_device_train_batch_size=128,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=32,
+    gradient_accumulation_steps=32,
     learning_rate=5e-4,
     fp16=True,
     logging_steps=10,
@@ -109,19 +111,56 @@ training_args = TrainingArguments(
     report_to="none"
 )
 
-trainer = WeightedTrainer(
-    model=model_weighted,
+trainer = Trainer(
+    model=model,
     train_dataset=train_dataset_final,
     eval_dataset=eval_dataset_final,
     data_collator=lambda features: custom_data_collator(features, tokenizer),
-    args=training_args
+    args=training_args,
+    callbacks=[callback] 
 )
 
 trainer.train()
 
-eval_results = trainer.evaluate()
-print("Validation loss:", eval_results.get("eval_loss"))
+# ######DUPLICATION SECTION#####
+#first train the duplicate data 
+subset_size = int(0.05 * len(train_dataset_final)) #toggle
+train_subset = train_dataset_final.select(range(subset_size))
 
-exact_h_rate, output_table = hallucination_analysis(model_weighted, train_dataset_final["y"], tokenizer, 128, device)
-miscal_rate, miscal_output_table = miscalibration_analysis(p_datasets, model_weighted, tokenizer, alpha, 0.1, device)
-print(f"Hallucination rate for weighted model is: {exact_h_rate} and miscalibration for weighted model is: {miscal_rate}")
+# Duplicate the subset three times
+duplications = 10 #toggle
+train_subset_duplicated = concatenate_datasets([train_subset] * duplications)
+
+# Define new training arguments for the additional 64 epochs
+upweight_training_args = TrainingArguments(
+    output_dir=f"cache/model_lora_alpha{alpha}_dup",  # new output directory to avoid conflicts
+    overwrite_output_dir=True,
+    num_train_epochs=64,
+    per_device_train_batch_size=32,
+    gradient_accumulation_steps=32,
+    learning_rate=5e-4,
+    fp16=True,
+    logging_steps=10,
+    save_strategy="no",
+    eval_strategy="epoch",
+    report_to="none"
+)
+
+# Create a new Trainer instance using the model and the duplicated subset
+trainer_dup = Trainer(
+    model=model, 
+    train_dataset=train_subset_duplicated,
+    eval_dataset=eval_dataset_final,
+    data_collator=lambda features: custom_data_collator(features, tokenizer),
+    args=upweight_training_args,
+    callbacks=[callback] 
+)
+
+# Continue training on the duplicated data
+trainer_dup.train()
+
+#######END OF TRAININIG####
+tvd, regret, miscal_output_table = miscalibration_analysis(p_datasets, train_datasets, model, tokenizer, alpha, 0.1, device)
+print(f"Loss rate is: miscalibration is: {tvd} and regret is: {regret}")
+miscal_output_table.to_csv(f"TBU", index=False)
+
