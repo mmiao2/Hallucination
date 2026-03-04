@@ -403,7 +403,7 @@ def hallucination_analysis(model, train_dataset_final, tokenizer, batch_size, al
         gens += tokenizer.batch_decode(outs, skip_special_tokens=True)
 
     # extract names, lookup golds, compute hall rates
-    names = [(" ".join(g.split()[:2])).rstrip("'s") for g in gens]
+    names = [(" ".join(g.split()[:2])).removesuffix("'s") for g in gens]
     golds_list = [name_to_gold.get(n, [None]*7)[1:] for n in names]
     hall_rates = []
     total_incorrect = total_attrs = 0
